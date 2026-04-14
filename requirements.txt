@@ -1,0 +1,4 @@
+openai
+python-telegram-bot==22.7
+requests
+imageio-ffmpeg
