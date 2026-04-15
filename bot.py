@@ -3,9 +3,10 @@ import logging
 import os
 import random
 import re
+import sqlite3
 import subprocess
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -34,7 +35,7 @@ TEXT_MODEL = os.environ.get("TEXT_MODEL", "gpt-4.1-mini")
 TRANSCRIBE_MODEL = os.environ.get("TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
 TTS_MODEL = os.environ.get("TTS_MODEL", "gpt-4o-mini-tts")
 DEFAULT_USER_NAME = os.environ.get("DEFAULT_USER_NAME", "AlphA")
-STATE_FILE = os.environ.get("STATE_FILE", "bot_state.json")
+SQLITE_DB_PATH = os.environ.get("SQLITE_DB_PATH", "luna_bot.db")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -108,27 +109,76 @@ MOOD_KEYWORDS = {
 }
 
 # =========================
-# STATE
+# DATABASE
 # =========================
-def load_state() -> dict[str, Any]:
-    try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception as e:
-        logger.warning("Failed to load state: %s", e)
-    return {"users": {}}
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(SQLITE_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def save_state(state: dict[str, Any]) -> None:
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.warning("Failed to save state: %s", e)
+def init_db() -> None:
+    with get_conn() as conn:
+        cur = conn.cursor()
 
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            mode TEXT NOT NULL DEFAULT 'mixed',
+            lesson_day INTEGER NOT NULL DEFAULT 0,
+            mood TEXT NOT NULL DEFAULT 'neutral',
+            practice_target_json TEXT,
+            streak_current INTEGER NOT NULL DEFAULT 0,
+            streak_best INTEGER NOT NULL DEFAULT 0,
+            streak_last_day TEXT,
+            streak_total_active_days INTEGER NOT NULL DEFAULT 0,
+            lessons_opened INTEGER NOT NULL DEFAULT 0,
+            practice_attempts INTEGER NOT NULL DEFAULT 0,
+            practice_successes INTEGER NOT NULL DEFAULT 0,
+            messages_total INTEGER NOT NULL DEFAULT 0,
+            voice_total INTEGER NOT NULL DEFAULT 0,
+            text_total INTEGER NOT NULL DEFAULT 0,
+            revision_sessions INTEGER NOT NULL DEFAULT 0,
+            vocab_saved INTEGER NOT NULL DEFAULT 0
+        )
+        """)
 
-GLOBAL_STATE = load_state()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS vocab (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            chinese TEXT NOT NULL,
+            pinyin TEXT NOT NULL,
+            meaning_bn TEXT NOT NULL,
+            source TEXT NOT NULL,
+            times_seen INTEGER NOT NULL DEFAULT 1,
+            correct_count INTEGER NOT NULL DEFAULT 0,
+            wrong_count INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(user_id, chinese)
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS revision_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            chinese TEXT NOT NULL,
+            position INTEGER NOT NULL
+        )
+        """)
+
+        conn.commit()
 
 
 def get_user_key(update: Update) -> str:
@@ -141,13 +191,10 @@ def get_user_key(update: Update) -> str:
 def default_user_state() -> dict[str, Any]:
     return {
         "name": DEFAULT_USER_NAME,
-        "mode": "mixed",  # mixed | chinese_only
+        "mode": "mixed",
         "lesson_day": 0,
-        "history": [],
         "mood": "neutral",
         "practice_target": None,
-        "vocab": [],
-        "revision_queue": [],
         "streak": {
             "current": 0,
             "best": 0,
@@ -167,37 +214,341 @@ def default_user_state() -> dict[str, Any]:
     }
 
 
+def ensure_user_exists(user_id: str) -> None:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        if row is None:
+            state = default_user_state()
+            cur.execute("""
+            INSERT INTO users (
+                user_id, name, mode, lesson_day, mood, practice_target_json,
+                streak_current, streak_best, streak_last_day, streak_total_active_days,
+                lessons_opened, practice_attempts, practice_successes,
+                messages_total, voice_total, text_total, revision_sessions, vocab_saved
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                user_id,
+                state["name"],
+                state["mode"],
+                state["lesson_day"],
+                state["mood"],
+                json.dumps(state["practice_target"], ensure_ascii=False),
+                state["streak"]["current"],
+                state["streak"]["best"],
+                state["streak"]["last_day"],
+                state["streak"]["total_active_days"],
+                state["progress"]["lessons_opened"],
+                state["progress"]["practice_attempts"],
+                state["progress"]["practice_successes"],
+                state["progress"]["messages_total"],
+                state["progress"]["voice_total"],
+                state["progress"]["text_total"],
+                state["progress"]["revision_sessions"],
+                state["progress"]["vocab_saved"],
+            ))
+            conn.commit()
+
+
 def get_user_state(update: Update) -> dict[str, Any]:
-    key = get_user_key(update)
-    users = GLOBAL_STATE.setdefault("users", {})
-    if key not in users:
-        users[key] = default_user_state()
-        save_state(GLOBAL_STATE)
-    return users[key]
+    user_id = get_user_key(update)
+    ensure_user_exists(user_id)
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+
+    if row is None:
+        return default_user_state()
+
+    practice_target = None
+    if row["practice_target_json"]:
+        try:
+            practice_target = json.loads(row["practice_target_json"])
+        except Exception:
+            practice_target = None
+
+    return {
+        "name": row["name"],
+        "mode": row["mode"],
+        "lesson_day": row["lesson_day"],
+        "mood": row["mood"],
+        "practice_target": practice_target,
+        "streak": {
+            "current": row["streak_current"],
+            "best": row["streak_best"],
+            "last_day": row["streak_last_day"],
+            "total_active_days": row["streak_total_active_days"],
+        },
+        "progress": {
+            "lessons_opened": row["lessons_opened"],
+            "practice_attempts": row["practice_attempts"],
+            "practice_successes": row["practice_successes"],
+            "messages_total": row["messages_total"],
+            "voice_total": row["voice_total"],
+            "text_total": row["text_total"],
+            "revision_sessions": row["revision_sessions"],
+            "vocab_saved": row["vocab_saved"],
+        },
+    }
 
 
-def update_user_state(update: Update, new_state: dict[str, Any]) -> None:
-    key = get_user_key(update)
-    GLOBAL_STATE.setdefault("users", {})[key] = new_state
-    save_state(GLOBAL_STATE)
+def update_user_state(update: Update, state: dict[str, Any]) -> None:
+    user_id = get_user_key(update)
+    ensure_user_exists(user_id)
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        UPDATE users
+        SET
+            name = ?,
+            mode = ?,
+            lesson_day = ?,
+            mood = ?,
+            practice_target_json = ?,
+            streak_current = ?,
+            streak_best = ?,
+            streak_last_day = ?,
+            streak_total_active_days = ?,
+            lessons_opened = ?,
+            practice_attempts = ?,
+            practice_successes = ?,
+            messages_total = ?,
+            voice_total = ?,
+            text_total = ?,
+            revision_sessions = ?,
+            vocab_saved = ?
+        WHERE user_id = ?
+        """, (
+            state["name"],
+            state["mode"],
+            state["lesson_day"],
+            state["mood"],
+            json.dumps(state["practice_target"], ensure_ascii=False),
+            state["streak"]["current"],
+            state["streak"]["best"],
+            state["streak"]["last_day"],
+            state["streak"]["total_active_days"],
+            state["progress"]["lessons_opened"],
+            state["progress"]["practice_attempts"],
+            state["progress"]["practice_successes"],
+            state["progress"]["messages_total"],
+            state["progress"]["voice_total"],
+            state["progress"]["text_total"],
+            state["progress"]["revision_sessions"],
+            state["progress"]["vocab_saved"],
+            user_id,
+        ))
+        conn.commit()
+
+
+def add_history(user_id: str, role: str, content: str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        INSERT INTO history (user_id, role, content, created_at)
+        VALUES (?, ?, ?, ?)
+        """, (user_id, role, content, now))
+
+        cur.execute("""
+        SELECT id FROM history WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT 12
+        """, (user_id,))
+        keep_ids = [str(r["id"]) for r in cur.fetchall()]
+
+        if keep_ids:
+            placeholder = ",".join("?" * len(keep_ids))
+            cur.execute(
+                f"DELETE FROM history WHERE user_id = ? AND id NOT IN ({placeholder})",
+                [user_id, *keep_ids]
+            )
+        conn.commit()
+
+
+def get_history(user_id: str) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        SELECT role, content FROM history
+        WHERE user_id = ?
+        ORDER BY id ASC
+        """, (user_id,))
+        rows = cur.fetchall()
+
+    return [
+        {
+            "role": row["role"],
+            "content": [{"type": "input_text" if row["role"] == "user" else "output_text", "text": row["content"]}],
+        }
+        for row in rows
+    ]
+
+
+def clear_history(user_id: str) -> None:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM history WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+
+def upsert_vocab(user_id: str, chinese: str, pinyin: str, meaning_bn: str, source: str) -> bool:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        SELECT id, times_seen FROM vocab
+        WHERE user_id = ? AND chinese = ?
+        """, (user_id, chinese))
+        row = cur.fetchone()
+
+        if row:
+            cur.execute("""
+            UPDATE vocab
+            SET times_seen = times_seen + 1
+            WHERE id = ?
+            """, (row["id"],))
+            conn.commit()
+            return False
+
+        cur.execute("""
+        INSERT INTO vocab (user_id, chinese, pinyin, meaning_bn, source, times_seen, correct_count, wrong_count)
+        VALUES (?, ?, ?, ?, ?, 1, 0, 0)
+        """, (user_id, chinese, pinyin, meaning_bn, source))
+        conn.commit()
+        return True
+
+
+def get_vocab(user_id: str) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        SELECT chinese, pinyin, meaning_bn, source, times_seen, correct_count, wrong_count
+        FROM vocab
+        WHERE user_id = ?
+        ORDER BY id ASC
+        """, (user_id,))
+        rows = cur.fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def get_vocab_item(user_id: str, chinese: str) -> dict[str, Any] | None:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        SELECT chinese, pinyin, meaning_bn, source, times_seen, correct_count, wrong_count
+        FROM vocab
+        WHERE user_id = ? AND chinese = ?
+        """, (user_id, chinese))
+        row = cur.fetchone()
+
+    return dict(row) if row else None
+
+
+def increment_vocab_correct(user_id: str, chinese: str) -> None:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        UPDATE vocab SET correct_count = correct_count + 1
+        WHERE user_id = ? AND chinese = ?
+        """, (user_id, chinese))
+        conn.commit()
+
+
+def increment_vocab_wrong(user_id: str, chinese: str) -> None:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        UPDATE vocab SET wrong_count = wrong_count + 1
+        WHERE user_id = ? AND chinese = ?
+        """, (user_id, chinese))
+        conn.commit()
+
+
+def clear_revision_queue(user_id: str) -> None:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM revision_queue WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+
+def build_revision_queue(user_id: str) -> None:
+    vocab = get_vocab(user_id)
+    weighted = []
+
+    for item in vocab:
+        weight = 1 + int(item["wrong_count"])
+        if int(item["correct_count"]) == 0:
+            weight += 1
+        weighted.extend([item["chinese"]] * weight)
+
+    random.shuffle(weighted)
+
+    unique = []
+    seen = set()
+    for chinese in weighted:
+        if chinese not in seen:
+            unique.append(chinese)
+            seen.add(chinese)
+
+    queue = unique[:10]
+
+    clear_revision_queue(user_id)
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        for pos, chinese in enumerate(queue):
+            cur.execute("""
+            INSERT INTO revision_queue (user_id, chinese, position)
+            VALUES (?, ?, ?)
+            """, (user_id, chinese, pos))
+        conn.commit()
+
+
+def get_revision_queue(user_id: str) -> list[str]:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        SELECT chinese FROM revision_queue
+        WHERE user_id = ?
+        ORDER BY position ASC
+        """, (user_id,))
+        rows = cur.fetchall()
+    return [row["chinese"] for row in rows]
+
+
+def pop_revision_queue(user_id: str) -> None:
+    queue = get_revision_queue(user_id)
+    if not queue:
+        return
+
+    queue = queue[1:]
+    clear_revision_queue(user_id)
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        for pos, chinese in enumerate(queue):
+            cur.execute("""
+            INSERT INTO revision_queue (user_id, chinese, position)
+            VALUES (?, ?, ?)
+            """, (user_id, chinese, pos))
+        conn.commit()
 
 # =========================
-# DATE / STREAK
+# STREAK
 # =========================
 def today_utc_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def previous_day_str(day_str: str) -> str:
-    dt = datetime.strptime(day_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    prev = dt.timestamp() - 86400
-    return datetime.fromtimestamp(prev, tz=timezone.utc).strftime("%Y-%m-%d")
-
-
-def touch_streak(user_state: dict[str, Any]) -> None:
+def touch_streak(state: dict[str, Any]) -> None:
     today = today_utc_str()
-    streak = user_state["streak"]
-    last_day = streak.get("last_day")
+    streak = state["streak"]
+    last_day = streak["last_day"]
 
     if last_day == today:
         return
@@ -209,7 +560,11 @@ def touch_streak(user_state: dict[str, Any]) -> None:
         streak["total_active_days"] += 1
         return
 
-    if last_day == previous_day_str(today):
+    last_dt = datetime.strptime(last_day, "%Y-%m-%d")
+    today_dt = datetime.strptime(today, "%Y-%m-%d")
+    diff_days = (today_dt - last_dt).days
+
+    if diff_days == 1:
         streak["current"] += 1
     else:
         streak["current"] = 1
@@ -279,90 +634,50 @@ def build_luna_reaction(user_name: str) -> str:
 # =========================
 # VOCAB / REVISION
 # =========================
-def ensure_vocab_entry(user_state: dict[str, Any], chinese: str, pinyin: str, meaning_bn: str, source: str) -> bool:
-    vocab = user_state["vocab"]
-    for item in vocab:
-        if item["chinese"] == chinese:
-            item["times_seen"] += 1
-            return False
-
-    entry = {
-        "chinese": chinese,
-        "pinyin": pinyin,
-        "meaning_bn": meaning_bn,
-        "source": source,
-        "times_seen": 1,
-        "correct_count": 0,
-        "wrong_count": 0,
-    }
-    vocab.append(entry)
-    user_state["progress"]["vocab_saved"] += 1
-    return True
-
-
-def add_lesson_vocab(user_state: dict[str, Any], lesson: dict[str, str]) -> None:
-    ensure_vocab_entry(
-        user_state,
+def add_lesson_vocab(update: Update, state: dict[str, Any], lesson: dict[str, str]) -> None:
+    user_id = get_user_key(update)
+    created = upsert_vocab(
+        user_id=user_id,
         chinese=lesson["chinese"],
         pinyin=lesson["pinyin"],
         meaning_bn=lesson["meaning_bn"],
         source=lesson["title"],
     )
+    if created:
+        state["progress"]["vocab_saved"] += 1
 
 
-def build_vocab_text(user_state: dict[str, Any]) -> str:
-    vocab = user_state["vocab"]
+def build_vocab_text(update: Update, state: dict[str, Any]) -> str:
+    user_id = get_user_key(update)
+    vocab = get_vocab(user_id)
+
     if not vocab:
         return "এখনও কোনো vocabulary save হয়নি। আগে /lesson বা /next দিয়ে কিছু শিখো 💛"
 
-    lines = [f"{user_state['name']} এর vocabulary notebook 📘", ""]
+    lines = [f'{state["name"]} এর vocabulary notebook 📘', ""]
     for idx, item in enumerate(vocab[-15:], start=1):
-        lines.append(
-            f"{idx}) {item['chinese']} | {item['pinyin']} | {item['meaning_bn']}"
-        )
+        lines.append(f'{idx}) {item["chinese"]} | {item["pinyin"]} | {item["meaning_bn"]}')
     return "\n".join(lines)
 
 
-def build_revision_queue(user_state: dict[str, Any]) -> None:
-    queue = []
-    for item in user_state["vocab"]:
-        weight = 1 + item.get("wrong_count", 0)
-        if item.get("correct_count", 0) == 0:
-            weight += 1
-        queue.extend([item["chinese"]] * weight)
+def format_revision_prompt(update: Update, state: dict[str, Any]) -> str:
+    user_id = get_user_key(update)
+    queue = get_revision_queue(user_id)
 
-    random.shuffle(queue)
-    seen = set()
-    unique_queue = []
-    for chinese in queue:
-        if chinese not in seen:
-            unique_queue.append(chinese)
-            seen.add(chinese)
+    if not queue:
+        build_revision_queue(user_id)
+        queue = get_revision_queue(user_id)
 
-    user_state["revision_queue"] = unique_queue[:10]
-
-
-def find_vocab_by_chinese(user_state: dict[str, Any], chinese: str) -> dict[str, Any] | None:
-    for item in user_state["vocab"]:
-        if item["chinese"] == chinese:
-            return item
-    return None
-
-
-def format_revision_prompt(user_state: dict[str, Any]) -> str:
-    if not user_state["revision_queue"]:
-        build_revision_queue(user_state)
-
-    if not user_state["revision_queue"]:
+    if not queue:
         return "এখনও revision-এর জন্য vocabulary নেই। আগে /lesson দিয়ে কিছু শিখো।"
 
-    current = user_state["revision_queue"][0]
-    item = find_vocab_by_chinese(user_state, current)
+    current = queue[0]
+    item = get_vocab_item(user_id, current)
     if not item:
-        user_state["revision_queue"] = []
+        clear_revision_queue(user_id)
         return "Revision queue refresh হয়েছে। আবার /revision দাও।"
 
-    if user_state["mode"] == "chinese_only":
+    if state["mode"] == "chinese_only":
         return f"""
 Revision time ✨
 
@@ -371,7 +686,7 @@ Word:
 Pinyin:
 {item["pinyin"]}
 
-{user_state["name"]}, say or type the meaning now.
+{state["name"]}, say or type the meaning now.
 """.strip()
 
     return f"""
@@ -382,19 +697,21 @@ Word:
 Pinyin:
 {item["pinyin"]}
 
-{user_state["name"]}, এখন এর মানে বলো 😊
+{state["name"]}, এখন এর মানে বলো 😊
 """.strip()
 
 
-def check_revision_answer(user_text: str, user_state: dict[str, Any]) -> str | None:
-    queue = user_state["revision_queue"]
+def check_revision_answer(update: Update, user_text: str, state: dict[str, Any]) -> str | None:
+    user_id = get_user_key(update)
+    queue = get_revision_queue(user_id)
+
     if not queue:
         return None
 
     current = queue[0]
-    item = find_vocab_by_chinese(user_state, current)
+    item = get_vocab_item(user_id, current)
     if not item:
-        user_state["revision_queue"] = []
+        clear_revision_queue(user_id)
         return None
 
     user_norm = normalize_text(strip_tone_marks(user_text))
@@ -416,13 +733,12 @@ def check_revision_answer(user_text: str, user_state: dict[str, Any]) -> str | N
             good = True
 
     if good:
-        item["correct_count"] += 1
-        queue.pop(0)
-        next_line = ""
-        if queue:
-            next_line = "\n\nআরেকটা revision করতে /revision দাও।"
+        increment_vocab_correct(user_id, current)
+        pop_revision_queue(user_id)
+        next_queue = get_revision_queue(user_id)
+        next_line = "\n\nআরেকটা revision করতে /revision দাও।" if next_queue else ""
         return f"""
-খুব ভালো {user_state['name']} 😊
+খুব ভালো {state["name"]} 😊
 
 {item["chinese"]} = {item["meaning_bn"]}
 Pinyin: {item["pinyin"]}
@@ -430,9 +746,9 @@ Pinyin: {item["pinyin"]}
 এই revisionটা ঠিক হয়েছে 💛{next_line}
 """.strip()
 
-    item["wrong_count"] += 1
+    increment_vocab_wrong(user_id, current)
     return f"""
-একটু miss হয়েছে {user_state['name']} 💛
+একটু miss হয়েছে {state["name"]} 💛
 
 ঠিকটা হলো:
 {item["chinese"]} = {item["meaning_bn"]}
@@ -476,20 +792,20 @@ Practice:
 """.strip()
 
 
-def set_practice_target(user_state: dict[str, Any], lesson: dict[str, str]) -> None:
-    user_state["practice_target"] = {
+def set_practice_target(state: dict[str, Any], lesson: dict[str, str]) -> None:
+    state["practice_target"] = {
         "chinese": lesson["practice"],
         "pinyin": lesson["practice_pinyin"],
         "title": lesson["title"],
     }
 
 
-def clear_practice_target(user_state: dict[str, Any]) -> None:
-    user_state["practice_target"] = None
+def clear_practice_target(state: dict[str, Any]) -> None:
+    state["practice_target"] = None
 
 
-def compare_pronunciation(user_text: str, target: dict[str, str], user_state: dict[str, Any]) -> str:
-    user_state["progress"]["practice_attempts"] += 1
+def compare_pronunciation(user_text: str, target: dict[str, str], state: dict[str, Any]) -> str:
+    state["progress"]["practice_attempts"] += 1
 
     spoken_raw = user_text.strip()
     spoken_norm = normalize_text(strip_tone_marks(spoken_raw))
@@ -501,10 +817,10 @@ def compare_pronunciation(user_text: str, target: dict[str, str], user_state: di
     best_ratio = max(ratio_ch, ratio_py)
 
     if spoken_norm == target_ch_norm or spoken_norm == target_py_norm or best_ratio >= 0.86:
-        user_state["progress"]["practice_successes"] += 1
-        clear_practice_target(user_state)
+        state["progress"]["practice_successes"] += 1
+        clear_practice_target(state)
         return f"""
-ভালো বলেছ {user_state['name']} 😊
+ভালো বলেছ {state["name"]} 😊
 
 Target:
 {target["chinese"]}
@@ -519,8 +835,8 @@ Target:
     else:
         feedback.append("তোমার spoken line target-এর সাথে পুরো match করেনি।")
 
-    feedback.append(f"Target Chinese: {target['chinese']}")
-    feedback.append(f"Target Pinyin: {target['pinyin']}")
+    feedback.append(f'Target Chinese: {target["chinese"]}')
+    feedback.append(f'Target Pinyin: {target["pinyin"]}')
     feedback.append(f"তুমি বলেছ: {spoken_raw}")
 
     if best_ratio >= 0.65:
@@ -529,16 +845,15 @@ Target:
         feedback.append("আরও একটু clear করে বলো। চাইলে আগে lineটা শুনে আবার repeat করো।")
 
     feedback.append("আমি exact tone score দিচ্ছি না, কিন্তু spoken match দেখে বলছি তুমি আরও একটু practice করলে better হবে।")
-
     return "\n".join(feedback)
 
 # =========================
 # SYSTEM PROMPT
 # =========================
-def build_system_prompt(user_state: dict[str, Any]) -> str:
-    user_name = user_state["name"]
-    mode = user_state["mode"]
-    mood = user_state["mood"]
+def build_system_prompt(state: dict[str, Any]) -> str:
+    user_name = state["name"]
+    mode = state["mode"]
+    mood = state["mood"]
 
     mode_instruction = {
         "mixed": (
@@ -646,9 +961,10 @@ def synthesize_speech(text: str, output_path: str) -> None:
 # =========================
 # AI REPLY
 # =========================
-def generate_ai_reply(user_text: str, user_state: dict[str, Any]) -> str:
-    history = user_state.get("history", [])
-    system_prompt = build_system_prompt(user_state)
+def generate_ai_reply(update: Update, user_text: str, state: dict[str, Any]) -> str:
+    user_id = get_user_key(update)
+    history = get_history(user_id)
+    system_prompt = build_system_prompt(state)
 
     input_items = list(history)
     input_items.append(
@@ -666,26 +982,15 @@ def generate_ai_reply(user_text: str, user_state: dict[str, Any]) -> str:
 
     reply_text = (response.output_text or "").strip()
     if not reply_text:
-        reply_text = f"আমি আছি {user_state['name']} 😊 আরেকবার বলো, আমি সাহায্য করছি।"
+        reply_text = f'আমি আছি {state["name"]} 😊 আরেকবার বলো, আমি সাহায্য করছি।'
 
     if should_add_luna_reaction(user_text):
-        reply_text = f"{build_luna_reaction(user_state['name'])}\n\n{reply_text}"
+        reply_text = f'{build_luna_reaction(state["name"])}\n\n{reply_text}'
 
     reply_text = clean_for_voice(reply_text)
 
-    history.append(
-        {
-            "role": "user",
-            "content": [{"type": "input_text", "text": user_text}],
-        }
-    )
-    history.append(
-        {
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": reply_text}],
-        }
-    )
-    user_state["history"] = history[-12:]
+    add_history(user_id, "user", user_text)
+    add_history(user_id, "assistant", reply_text)
 
     return reply_text
 
@@ -693,26 +998,21 @@ def generate_ai_reply(user_text: str, user_state: dict[str, Any]) -> str:
 # COMMANDS
 # =========================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_state = get_user_state(update)
-    user_state["name"] = DEFAULT_USER_NAME
-    touch_streak(user_state)
-    update_user_state(update, user_state)
+    state = get_user_state(update)
+    state["name"] = DEFAULT_USER_NAME
+    touch_streak(state)
+    update_user_state(update, state)
 
     text = f"""
 আমি {BOT_NAME} 🌙
 আমি তোমার soft Chinese learning companion.
 
-আমি তোমাকে {user_state["name"]} বলে ডাকব 💛
+আমি তোমাকে {state["name"]} বলে ডাকব 💛
 
 আমি Bangla, English, Chinese — সব বুঝতে পারি।
 তুমি mixed language-এও কথা বলতে পারো।
 
-New features:
-- smart revision mode
-- vocabulary notebook
-- streak system
-- progress tracker
-- pronunciation practice
+SQLite database version active আছে ✅
 
 Try:
 - /lesson
@@ -756,55 +1056,65 @@ Examples:
 
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_state = default_user_state()
-    update_user_state(update, user_state)
-    await update.message.reply_text("ঠিক আছে 💛 memory, progress, mood, vocab, revision, আর practice target reset করে দিলাম।")
+    user_id = get_user_key(update)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+        cur.execute("DELETE FROM history WHERE user_id = ?", (user_id,))
+        cur.execute("DELETE FROM vocab WHERE user_id = ?", (user_id,))
+        cur.execute("DELETE FROM revision_queue WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+    ensure_user_exists(user_id)
+    await update.message.reply_text("ঠিক আছে 💛 database memory, progress, vocab, revision queue, আর practice target reset করে দিলাম।")
 
 
 async def lesson_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_state = get_user_state(update)
-    touch_streak(user_state)
-    idx = user_state["lesson_day"]
-    lesson = LESSONS[idx]
-    user_state["progress"]["lessons_opened"] += 1
-    add_lesson_vocab(user_state, lesson)
-    set_practice_target(user_state, lesson)
-    update_user_state(update, user_state)
+    state = get_user_state(update)
+    touch_streak(state)
 
-    text = format_lesson(lesson, user_state["name"], user_state["mode"])
+    idx = state["lesson_day"]
+    lesson = LESSONS[idx]
+    state["progress"]["lessons_opened"] += 1
+    add_lesson_vocab(update, state, lesson)
+    set_practice_target(state, lesson)
+    update_user_state(update, state)
+
+    text = format_lesson(lesson, state["name"], state["mode"])
     await update.message.reply_text(text)
 
 
 async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_state = get_user_state(update)
-    touch_streak(user_state)
-    idx = (user_state["lesson_day"] + 1) % len(LESSONS)
-    user_state["lesson_day"] = idx
-    lesson = LESSONS[idx]
-    user_state["progress"]["lessons_opened"] += 1
-    add_lesson_vocab(user_state, lesson)
-    set_practice_target(user_state, lesson)
-    update_user_state(update, user_state)
+    state = get_user_state(update)
+    touch_streak(state)
 
-    text = format_lesson(lesson, user_state["name"], user_state["mode"])
+    idx = (state["lesson_day"] + 1) % len(LESSONS)
+    state["lesson_day"] = idx
+    lesson = LESSONS[idx]
+    state["progress"]["lessons_opened"] += 1
+    add_lesson_vocab(update, state, lesson)
+    set_practice_target(state, lesson)
+    update_user_state(update, state)
+
+    text = format_lesson(lesson, state["name"], state["mode"])
     await update.message.reply_text(text)
 
 
 async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_state = get_user_state(update)
-    p = user_state["progress"]
-    current_lesson = LESSONS[user_state["lesson_day"]]["title"]
-    streak = user_state["streak"]
+    state = get_user_state(update)
+    p = state["progress"]
+    current_lesson = LESSONS[state["lesson_day"]]["title"]
+    streak = state["streak"]
 
     success_rate = 0.0
     if p["practice_attempts"] > 0:
         success_rate = round((p["practice_successes"] / p["practice_attempts"]) * 100, 1)
 
     text = f"""
-{user_state["name"]} এর progress 📘
+{state["name"]} এর progress 📘
 
-Current mode: {user_state["mode"]}
-Current mood tag: {user_state["mood"]}
+Current mode: {state["mode"]}
+Current mood tag: {state["mood"]}
 Current lesson: {current_lesson}
 
 Lessons opened: {p["lessons_opened"]}
@@ -828,24 +1138,24 @@ Text messages: {p["text_total"]}
 
 
 async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_state = get_user_state(update)
+    state = get_user_state(update)
 
     if not context.args:
         await update.message.reply_text(
-            f"Current mode: {user_state['mode']}\nUse:\n/mode mixed\n/mode chinese"
+            f'Current mode: {state["mode"]}\nUse:\n/mode mixed\n/mode chinese'
         )
         return
 
     arg = context.args[0].strip().lower()
     if arg in {"mixed", "mix"}:
-        user_state["mode"] = "mixed"
-        update_user_state(update, user_state)
+        state["mode"] = "mixed"
+        update_user_state(update, state)
         await update.message.reply_text("ঠিক আছে 💛 এখন mode = mixed.")
         return
 
     if arg in {"chinese", "cn"}:
-        user_state["mode"] = "chinese_only"
-        update_user_state(update, user_state)
+        state["mode"] = "chinese_only"
+        update_user_state(update, state)
         await update.message.reply_text("ঠিক আছে ✨ এখন mode = chinese_only. আমি mostly Chinese + pinyin-এ reply দেব, কিন্তু সব ভাষা বুঝব।")
         return
 
@@ -853,117 +1163,117 @@ async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def vocab_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_state = get_user_state(update)
-    await update.message.reply_text(build_vocab_text(user_state))
+    state = get_user_state(update)
+    await update.message.reply_text(build_vocab_text(update, state))
 
 
 async def revision_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_state = get_user_state(update)
-    touch_streak(user_state)
-    user_state["progress"]["revision_sessions"] += 1
-    if not user_state["revision_queue"]:
-        build_revision_queue(user_state)
-    update_user_state(update, user_state)
-    await update.message.reply_text(format_revision_prompt(user_state))
+    state = get_user_state(update)
+    touch_streak(state)
+    state["progress"]["revision_sessions"] += 1
+    update_user_state(update, state)
+    await update.message.reply_text(format_revision_prompt(update, state))
 
 
 async def streak_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_state = get_user_state(update)
-    streak = user_state["streak"]
+    state = get_user_state(update)
+    streak = state["streak"]
+
     text = f"""
-{user_state["name"]} এর streak 🔥
+{state["name"]} এর streak 🔥
 
 Current streak: {streak["current"]} day
 Best streak: {streak["best"]} day
 Total active days: {streak["total_active_days"]}
 
-আজ যদি practice করো, streak সুন্দরভাবে continue হবে 💛
+আজ যদি practice করো, streak continue হবে 💛
 """.strip()
+
     await update.message.reply_text(text)
 
 # =========================
 # MESSAGE LOGIC
 # =========================
-def maybe_handle_lesson_request(user_text: str, user_state: dict[str, Any]) -> str | None:
+def maybe_handle_lesson_request(update: Update, user_text: str, state: dict[str, Any]) -> str | None:
     text = user_text.lower()
 
     day_match = re.search(r"\bday\s*(\d+)\b", text)
     if day_match:
         day_num = int(day_match.group(1))
         if 1 <= day_num <= len(LESSONS):
-            user_state["lesson_day"] = day_num - 1
-            lesson = LESSONS[user_state["lesson_day"]]
-            user_state["progress"]["lessons_opened"] += 1
-            add_lesson_vocab(user_state, lesson)
-            set_practice_target(user_state, lesson)
-            return format_lesson(lesson, user_state["name"], user_state["mode"])
+            state["lesson_day"] = day_num - 1
+            lesson = LESSONS[state["lesson_day"]]
+            state["progress"]["lessons_opened"] += 1
+            add_lesson_vocab(update, state, lesson)
+            set_practice_target(state, lesson)
+            return format_lesson(lesson, state["name"], state["mode"])
 
     lesson_keywords = [
         "lesson", "class", "শেখাও", "lesson dao", "daily lesson", "practice dao", "chinese practice"
     ]
     if any(k.lower() in text for k in lesson_keywords):
-        lesson = LESSONS[user_state["lesson_day"]]
-        user_state["progress"]["lessons_opened"] += 1
-        add_lesson_vocab(user_state, lesson)
-        set_practice_target(user_state, lesson)
-        return format_lesson(lesson, user_state["name"], user_state["mode"])
+        lesson = LESSONS[state["lesson_day"]]
+        state["progress"]["lessons_opened"] += 1
+        add_lesson_vocab(update, state, lesson)
+        set_practice_target(state, lesson)
+        return format_lesson(lesson, state["name"], state["mode"])
 
     if "next lesson" in text or "next class" in text or "পরের lesson" in text:
-        user_state["lesson_day"] = (user_state["lesson_day"] + 1) % len(LESSONS)
-        lesson = LESSONS[user_state["lesson_day"]]
-        user_state["progress"]["lessons_opened"] += 1
-        add_lesson_vocab(user_state, lesson)
-        set_practice_target(user_state, lesson)
-        return format_lesson(lesson, user_state["name"], user_state["mode"])
+        state["lesson_day"] = (state["lesson_day"] + 1) % len(LESSONS)
+        lesson = LESSONS[state["lesson_day"]]
+        state["progress"]["lessons_opened"] += 1
+        add_lesson_vocab(update, state, lesson)
+        set_practice_target(state, lesson)
+        return format_lesson(lesson, state["name"], state["mode"])
 
     return None
 
 
-def maybe_handle_revision_answer(user_text: str, user_state: dict[str, Any]) -> str | None:
-    queue = user_state.get("revision_queue", [])
+def maybe_handle_revision_answer(update: Update, user_text: str, state: dict[str, Any]) -> str | None:
+    user_id = get_user_key(update)
+    queue = get_revision_queue(user_id)
     if not queue:
         return None
 
-    # explicit signals অথবা short answer হলে revision উত্তর ধরবে
     lowered = user_text.lower()
     signals = ["মানে", "meaning", "answer", "uttor", "উত্তর"]
     if len(user_text) <= 80 or any(s in lowered for s in signals):
-        return check_revision_answer(user_text, user_state)
+        return check_revision_answer(update, user_text, state)
 
     return None
 
 
-def build_reply(user_text: str, user_state: dict[str, Any]) -> str:
-    user_state["mood"] = estimate_mood(user_text)
+def build_reply(update: Update, user_text: str, state: dict[str, Any]) -> str:
+    state["mood"] = estimate_mood(user_text)
 
-    revision_reply = maybe_handle_revision_answer(user_text, user_state)
+    revision_reply = maybe_handle_revision_answer(update, user_text, state)
     if revision_reply:
         return clean_for_voice(revision_reply)
 
-    lesson_reply = maybe_handle_lesson_request(user_text, user_state)
+    lesson_reply = maybe_handle_lesson_request(update, user_text, state)
     if lesson_reply:
         if should_add_luna_reaction(user_text):
-            return clean_for_voice(f"{build_luna_reaction(user_state['name'])}\n\n{lesson_reply}")
+            return clean_for_voice(f'{build_luna_reaction(state["name"])}\n\n{lesson_reply}')
         return clean_for_voice(lesson_reply)
 
-    target = user_state.get("practice_target")
+    target = state.get("practice_target")
     practice_words = ["repeat", "বললাম", "ami bollam", "practice", "শুনো", "i said", "i say", "i said:"]
     if target:
         shortish = len(user_text) <= 80
         if shortish or any(w.lower() in user_text.lower() for w in practice_words):
-            return clean_for_voice(compare_pronunciation(user_text, target, user_state))
+            return clean_for_voice(compare_pronunciation(user_text, target, state))
 
-    return generate_ai_reply(user_text, user_state)
+    return generate_ai_reply(update, user_text, state)
 
 # =========================
 # AUDIO
 # =========================
-def transcribe_and_build_reply(update: Update, user_state: dict[str, Any], mp3_path: str) -> tuple[str, str]:
+def transcribe_and_build_reply(update: Update, state: dict[str, Any], mp3_path: str) -> tuple[str, str]:
     user_text = transcribe_audio(mp3_path)
     if not user_text:
         return "", "তোমার voice থেকে clear text পাইনি। আরেকবার একটু পরিষ্কার করে বলো 💛"
 
-    reply_text = build_reply(user_text, user_state)
+    reply_text = build_reply(update, user_text, state)
     return user_text, reply_text
 
 # =========================
@@ -974,11 +1284,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not user_text:
         return
 
-    user_state = get_user_state(update)
-    touch_streak(user_state)
-    user_state["progress"]["messages_total"] += 1
-    user_state["progress"]["text_total"] += 1
-    update_user_state(update, user_state)
+    state = get_user_state(update)
+    touch_streak(state)
+    state["progress"]["messages_total"] += 1
+    state["progress"]["text_total"] += 1
+    update_user_state(update, state)
 
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id,
@@ -986,8 +1296,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
     try:
-        reply_text = build_reply(user_text, user_state)
-        update_user_state(update, user_state)
+        reply_text = build_reply(update, user_text, state)
+        update_user_state(update, state)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             out_path = str(Path(tmpdir) / "reply.mp3")
@@ -1010,11 +1320,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not voice:
         return
 
-    user_state = get_user_state(update)
-    touch_streak(user_state)
-    user_state["progress"]["messages_total"] += 1
-    user_state["progress"]["voice_total"] += 1
-    update_user_state(update, user_state)
+    state = get_user_state(update)
+    touch_streak(state)
+    state["progress"]["messages_total"] += 1
+    state["progress"]["voice_total"] += 1
+    update_user_state(update, state)
 
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id,
@@ -1031,9 +1341,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await tg_file.download_to_drive(custom_path=raw_path)
 
             convert_telegram_voice_to_mp3(raw_path, mp3_path)
-            user_text, reply_text = transcribe_and_build_reply(update, user_state, mp3_path)
+            user_text, reply_text = transcribe_and_build_reply(update, state, mp3_path)
 
-            update_user_state(update, user_state)
+            update_user_state(update, state)
 
             if not user_text:
                 await update.message.reply_text(reply_text)
@@ -1056,6 +1366,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # MAIN
 # =========================
 def main() -> None:
+    init_db()
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_command))
